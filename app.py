@@ -1,4 +1,4 @@
-from flask import Flask, request, session, redirect, url_for, jsonify, send_file, g
+from flask import Flask, request, session, redirect, url_for, jsonify, send_file, g, Response
 import mysql.connector
 from mysql.connector import pooling
 import os
@@ -15,7 +15,11 @@ from datetime import timedelta
 
 from werkzeug.security import generate_password_hash, check_password_hash
 
+import csv
+import io
+
 import exam_attempts as ea
+import exam_bank as eb
 import exam_locks
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -150,7 +154,7 @@ def ensure_face_references_table(conn):
     cursor.execute(
         """CREATE TABLE IF NOT EXISTS face_references (
             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(191) NOT NULL UNIQUE,
+            user_id INT NOT NULL UNIQUE,
             descriptor LONGTEXT NOT NULL,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
@@ -167,7 +171,7 @@ def ensure_behavior_events_table(conn):
     cursor.execute(
         """CREATE TABLE IF NOT EXISTS behavior_events (
             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(191) NOT NULL,
+            user_id INT NOT NULL,
             username VARCHAR(191) NOT NULL,
             student_name VARCHAR(255) NOT NULL,
             exam_title VARCHAR(255) NOT NULL,
@@ -175,7 +179,10 @@ def ensure_behavior_events_table(conn):
             reason TEXT NOT NULL,
             warning_number INT NULL,
             elapsed_seconds INT NOT NULL DEFAULT 0,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            attempt_id BIGINT NULL,
+            KEY idx_behavior_user (user_id),
+            KEY idx_behavior_attempt (attempt_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
     )
     conn.commit()
@@ -1226,41 +1233,32 @@ def exam_action_html(exam_key, state):
 @app.route("/student/exams")
 def student_exams():
     conn = get_db()
-    states = {k: ea.get_exam_state(conn, session["user_id"], k)[0] for k in EXAM_TITLES}
+    cards = []
+    for e in eb.list_exams(conn, published_only=True):
+        state = ea.get_exam_state(conn, session["user_id"], e["key"])[0]
+        cards.append(f"""
+    <div class="card" style="margin-top:18px;">
+        <div class="exam-row">
+            <div>
+                <div class="card-icon">📝</div>
+                <h3>{htmllib.escape(e["title"])}</h3>
+                <p>{e["question_count"]} questions · {e["total_marks"]} marks · {e["duration_minutes"]} minutes. Camera and microphone verification are required.</p>
+            </div>
+            {exam_action_html(e["key"], state)}
+        </div>
+    </div>""")
+    body = "".join(cards) or '<div class="card"><p>No examinations are available right now.</p></div>'
     content = navbar() + f"""
 <main class="container">
     <div class="hero">
         <h1>Examinations</h1>
         <p>Select an examination and complete the security verification.</p>
     </div>
-
-    <div class="card">
-        <div class="exam-row">
-            <div>
-                <div class="card-icon">📝</div>
-                <h3>Midterm Examination</h3>
-                <p>Camera and microphone verification are required.</p>
-            </div>
-            {exam_action_html("midterm", states["midterm"])}
-        </div>
-    </div>
-
-    <div class="card" style="margin-top:18px;">
-        <div class="exam-row">
-            <div>
-                <div class="card-icon">🎓</div>
-                <h3>Final Examination</h3>
-                <p>Complete the security check before entering the exam.</p>
-            </div>
-            {exam_action_html("final", states["final"])}
-        </div>
-    </div>
-
+    {body}
     <a class="back" href="/student/dashboard">← Back to Dashboard</a>
 </main>
 """
     return page("Examinations", content)
-
 
 
 # Course details
@@ -1302,8 +1300,8 @@ def course(course_name):
 
     <div class="card" style="margin-top:20px;">
         <h3>Examination</h3>
-        <p>When you are ready, proceed to the final examination.</p>
-        <a class="btn" href="/exam/final">Final Exam</a>
+        <p>Your published examinations are listed on the Examinations page.</p>
+        <a class="btn" href="/student/exams">View Examinations</a>
     </div>
 
     <a class="back" href="/student/courses">← Back to Courses</a>
@@ -1314,47 +1312,7 @@ def course(course_name):
 
 # Exams
 
-# Sample exam (Database course). Answer keys are intentionally NOT included:
-# the browser only receives questions, never correct answers.
-SAMPLE_EXAM = {
-    "duration_minutes": 30,
-    "questions": [
-        {"type": "mcq", "marks": 2, "text": "Which SQL command is used to retrieve data from a database?",
-         "options": ["INSERT", "SELECT", "UPDATE", "DELETE"]},
-        {"type": "mcq", "marks": 2, "text": "What is the main purpose of a PRIMARY KEY?",
-         "options": ["To encrypt a table", "To uniquely identify each row", "To sort the table alphabetically", "To delete duplicate tables"]},
-        {"type": "mcq", "marks": 2, "text": "Which normal form removes partial dependency?",
-         "options": ["First normal form (1NF)", "Second normal form (2NF)", "Third normal form (3NF)", "Boyce-Codd normal form (BCNF)"]},
-        {"type": "mcq", "marks": 2, "text": "Which SQL clause is used to filter records?",
-         "options": ["GROUP BY", "ORDER BY", "WHERE", "LIMIT"]},
-        {"type": "mcq", "marks": 2, "text": "Which keyword is used to sort the result set?",
-         "options": ["SORT", "ORDER BY", "ARRANGE", "GROUP"]},
-        {"type": "mcq", "marks": 2, "text": "Which of the following is a relational database management system?",
-         "options": ["MySQL", "Photoshop", "Excel Charts", "Notepad"]},
-
-        {"type": "tf", "marks": 1, "text": "A table can have more than one primary key."},
-        {"type": "tf", "marks": 1, "text": "A foreign key creates a link between two tables."},
-        {"type": "tf", "marks": 1, "text": "The DELETE command removes the whole table structure from the database."},
-        {"type": "tf", "marks": 1, "text": "NULL is the same as zero."},
-
-        {"type": "match", "marks": 4, "text": "Match each SQL command with its purpose.",
-         "left": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-         "right": ["Modify existing rows", "Remove rows", "Retrieve data", "Add a new row"]},
-        {"type": "match", "marks": 4, "text": "Match each database term with its definition.",
-         "left": ["Primary key", "Foreign key", "Index", "View"],
-         "right": ["Speeds up searching", "A virtual table built from a query", "Links a table to another table", "Uniquely identifies a row"]},
-
-        {"type": "short", "marks": 4, "text": "Define a database in one or two sentences."},
-        {"type": "short", "marks": 4, "text": "Explain the difference between the DELETE and DROP commands."},
-        {"type": "short", "marks": 4, "text": "Write an SQL query that returns all columns of every row from a table named students."},
-    ],
-}
-for _i, _q in enumerate(SAMPLE_EXAM["questions"], start=1):
-    _q["id"] = "q%d" % _i
-
-# Exams the server knows about. The browser sends only the key; titles and
-# durations always come from here, never from the page.
-EXAM_TITLES = {"midterm": "Midterm Examination", "final": "Final Examination"}
+# Exams, questions and answer keys live in the database (see exam_bank.py).
 
 
 def ensure_exam_submissions_table(conn):
@@ -1362,14 +1320,17 @@ def ensure_exam_submissions_table(conn):
     cursor.execute(
         """CREATE TABLE IF NOT EXISTS exam_submissions (
             id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(191) NOT NULL,
+            user_id INT NOT NULL,
             username VARCHAR(191) NOT NULL,
             student_name VARCHAR(255) NOT NULL,
             exam_title VARCHAR(255) NOT NULL,
             status VARCHAR(30) NOT NULL,
             answers LONGTEXT NOT NULL,
             elapsed_seconds INT NOT NULL DEFAULT 0,
-            submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            submitted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            attempt_id BIGINT NULL,
+            UNIQUE KEY uq_submission_attempt (attempt_id),
+            KEY idx_submission_user (user_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
     )
     conn.commit()
@@ -1377,6 +1338,8 @@ def ensure_exam_submissions_table(conn):
 
 run_startup_task(ensure_exam_submissions_table)
 run_startup_task(ea.ensure_schema)
+run_startup_task(eb.ensure_schema)
+run_startup_task(eb.seed_if_empty)
 
 
 def log_behavior_event(conn, attempt, etype, reason, warning_number=None):
@@ -1390,7 +1353,7 @@ def log_behavior_event(conn, attempt, etype, reason, warning_number=None):
            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (session["user_id"], session.get("username", ""),
          session.get("student_name", session.get("username", "")),
-         EXAM_TITLES.get(attempt["exam_key"], attempt["exam_key"]),
+         eb.get_title(conn, attempt["exam_key"]),
          etype, str(reason)[:1000], warning_number, elapsed, attempt["id"])
     )
     conn.commit()
@@ -1416,8 +1379,17 @@ def exam_submit_api():
             conn, attempt, client_status, answers,
             session.get("student_name", session.get("username", "")),
             session.get("username", ""),
-            EXAM_TITLES.get(attempt["exam_key"], attempt["exam_key"]),
+            eb.get_title(conn, attempt["exam_key"]),
         )
+        if not duplicate:
+            try:
+                eb.record_score(conn, attempt["id"], attempt["exam_key"], data.get("answers", {}))
+            except Exception:
+                app.logger.exception("The submission was saved but could not be scored")
+                try:
+                    get_db().rollback()
+                except Exception:
+                    pass
         if not duplicate and final != "terminated":
             note = {"time_up": "Time ended. Exam submitted automatically.",
                     "late": "Exam submitted after the deadline grace period."}.get(final, "Exam submitted.")
@@ -2162,7 +2134,6 @@ function analyzeBehaviorFrame() {
     if (faces.length > 1) {
         gazeDeviationSince = null;
         setGazeReminder(false);
-
         lookingAwaySince = null;
         setLive("More than one face detected", false);
         behaviorWarning("More than one face was detected. Please ensure you are alone in the camera view.");
@@ -2467,15 +2438,18 @@ def exam_blocked_page(title, state):
 def exam_entry(exam_key):
     if session.get("role") != "student" or not session.get("user_id"):
         return redirect(url_for("student"))
-    title = EXAM_TITLES.get(exam_key)
-    if not title:
+    conn = get_db()
+    exam = eb.get_exam_by_key(conn, exam_key)
+    if not exam:
         return "Examination not found.", 404
-    state, _attempt = ea.get_exam_state(get_db(), session["user_id"], exam_key)
+    state, _attempt = ea.get_exam_state(conn, session["user_id"], exam_key)
     if state == "locked":
-        return exam_blocked_page(title, state), 403
+        return exam_blocked_page(exam["title"], state), 403
     if state == "completed":
-        return exam_blocked_page(title, state)
-    return exam_page(title, exam_key)
+        return exam_blocked_page(exam["title"], state)
+    if exam["status"] != "published" and state != "in_progress":
+        return "This examination is not available.", 404
+    return exam_page(exam["title"], exam_key)
 
 
 @app.route("/api/attempt/start", methods=["POST"])
@@ -2485,10 +2459,11 @@ def attempt_start_api():
         return auth_error
     data = request.get_json(silent=True) or {}
     exam_key = str(data.get("exam_key", ""))
-    if exam_key not in EXAM_TITLES:
-        return jsonify({"ok": False, "message": "Unknown examination."}), 400
     try:
         conn = get_db()
+        exam = eb.get_exam_by_key(conn, exam_key)
+        if not exam:
+            return jsonify({"ok": False, "message": "Unknown examination."}), 400
         uid = session["user_id"]
         state, attempt = ea.get_exam_state(conn, uid, exam_key)
         if state == "locked":
@@ -2497,6 +2472,9 @@ def attempt_start_api():
         if state == "completed":
             return jsonify({"ok": False, "state": "completed",
                             "message": "This examination has already been completed."}), 403
+        if state == "new" and exam["status"] != "published":
+            return jsonify({"ok": False, "state": "unavailable",
+                            "message": "This examination is not available."}), 403
 
         # Face-verification gate: a fresh pass is required, and it is single-use.
         verified_at = session.pop("face_verified_ts", None)
@@ -2504,10 +2482,14 @@ def attempt_start_api():
             return jsonify({"ok": False, "state": "face_required",
                             "message": "Face verification is required before the exam can start. Please run the security check again."}), 403
 
+        full = eb.get_exam_full(conn, exam["id"])
+        if not full["questions"]:
+            return jsonify({"ok": False, "state": "unavailable",
+                            "message": "This examination has no questions yet."}), 403
+
         resumed = state == "in_progress"
         if not resumed:
-            attempt, created = ea.create_attempt(
-                conn, uid, exam_key, SAMPLE_EXAM["duration_minutes"] * 60)
+            attempt, created = ea.create_attempt(conn, uid, exam_key, exam["duration_minutes"] * 60)
             resumed = not created
         log_behavior_event(conn, attempt, "resumed" if resumed else "started",
                            "Exam resumed after the page was reloaded." if resumed else "Exam started.")
@@ -2517,7 +2499,7 @@ def attempt_start_api():
             "resumed": resumed,
             "remaining_seconds": ea.remaining_seconds(attempt),
             "warning_count": attempt["warning_count"],
-            "exam": SAMPLE_EXAM,
+            "exam": eb.for_student(full),
         })
     except Exception:
         app.logger.exception("Unable to start exam attempt")
@@ -2629,9 +2611,9 @@ def teacher_dashboard():
     <div class="grid">
         <div class="card">
             <div class="card-icon">📚</div>
-            <h3>My Courses</h3>
-            <p>View the courses assigned to you.</p>
-            <a class="btn" href="/course/database">View Courses</a>
+            <h3>Manage Exams</h3>
+            <p>Create, edit and publish exams, then review scores and mark short answers.</p>
+            <a class="btn" href="/teacher/exams">Open Exams</a>
         </div>
 
         <div class="card">
@@ -2645,9 +2627,7 @@ def teacher_dashboard():
             <div class="card-icon">➕</div>
             <h3>Create Exam</h3>
             <p>Add an examination to the platform.</p>
-            <button class="btn" onclick="alert('Exam creation module can be connected here.')">
-                Add Exam
-            </button>
+            <a class="btn" href="/teacher/exams/new">Add Exam</a>
         </div>
     </div>
 </main>
@@ -2714,14 +2694,658 @@ def format_minute(seconds):
     return "%02d:%02d" % (seconds // 60, seconds % 60)
 
 
-@app.route("/teacher/reports")
-def teacher_reports():
-    if session.get("role") != "teacher":
-        return redirect(url_for("teacher"))
+# ---------------------------------------------------------------------------
+# Teacher: exam management, results, grading
+# ---------------------------------------------------------------------------
 
-    from risk_analytics import summarize, split_attempts, WEIGHTS
-    from collections import defaultdict, Counter
+def teacher_page_required():
+    if session.get("role") != "teacher" or not session.get("user_id"):
+        return redirect(url_for("teacher"))
+    return None
+
+
+def teacher_api_required():
+    if session.get("role") != "teacher" or not session.get("user_id"):
+        return jsonify({"ok": False, "error": "Teacher sign-in required."}), 403
+    return None
+
+
+def csv_cell(value):
+    """Spreadsheet-safe cell: text that starts with = + - @ would otherwise run as a formula."""
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
+def csv_response(filename, header, rows):
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(header)
+    for row in rows:
+        writer.writerow([csv_cell(v) for v in row])
+    data = "\ufeff" + buffer.getvalue()  # BOM so Excel shows Arabic names correctly
+    return Response(data, mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": "attachment; filename=%s" % filename})
+
+
+def fmt_score(score, max_score):
+    if score is None or max_score is None:
+        return "—"
+    return "%s / %s" % (("%g" % score), ("%g" % max_score))
+
+
+EXAM_ADMIN_CSS = """<style>
+.tbl { width:100%; border-collapse:collapse; background:#fff; border-radius:12px; overflow:hidden; }
+.tbl th, .tbl td { padding:10px 12px; border-bottom:1px solid #e3ebf5; text-align:left; vertical-align:top; }
+.tbl th { background:#f3f7fc; font-size:13px; color:#44546a; }
+.badge { display:inline-block; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:700; }
+.b-green { background:#e7f6ee; color:#067647; } .b-amber { background:#fff4d6; color:#8a5a00; }
+.b-red { background:#fdecea; color:#b42318; } .b-grey { background:#eef2f7; color:#44546a; }
+.btn.small { padding:6px 12px; font-size:13px; } .btn.danger { background:#b42318; }
+.row-actions { display:flex; flex-wrap:wrap; gap:6px; }
+.notice { background:#e7f6ee; color:#067647; padding:12px 14px; border-radius:10px; margin-bottom:14px; font-weight:600; }
+.warnbox { background:#fff4d6; color:#633b00; padding:12px 14px; border-radius:10px; margin-bottom:14px; }
+.errbox { background:#fdecea; color:#b42318; padding:12px 14px; border-radius:10px; margin-bottom:14px; }
+</style>"""
+
+
+def status_badge(status):
+    cls = {"published": "b-green", "draft": "b-grey", "submitted": "b-green", "time_up": "b-amber",
+           "late": "b-amber", "terminated": "b-red"}.get(status, "b-grey")
+    return '<span class="badge %s">%s</span>' % (cls, htmllib.escape(status.replace("_", " ").title()))
+
+
+@app.route("/teacher/exams")
+def teacher_exams():
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    esc = htmllib.escape
+    exams = eb.list_exams(get_db())
+    rows = []
+    for e in exams:
+        locked = e["attempt_count"] > 0
+        toggle = ("Unpublish", "draft") if e["status"] == "published" else ("Publish", "published")
+        rows.append(
+            "<tr><td><b>%s</b><br><small>/exam/%s</small></td><td>%d</td><td>%d</td><td>%d min</td><td>%s</td><td>%d</td>"
+            '<td><div class="row-actions">'
+            '<a class="btn small" href="/teacher/exams/%d/edit">Edit</a>'
+            '<a class="btn small secondary" href="/teacher/exams/%d/results">Results</a>'
+            '<button class="btn small secondary" onclick="examAction(%d, \'status\', \'%s\')">%s</button>'
+            '<button class="btn small secondary" onclick="examAction(%d, \'duplicate\')">Duplicate</button>'
+            '<button class="btn small danger" %s onclick="examAction(%d, \'delete\')">Delete</button>'
+            "</div></td></tr>" % (
+                esc(e["title"]), esc(e["key"]), e["question_count"], e["total_marks"], e["duration_minutes"],
+                status_badge(e["status"]), e["attempt_count"], e["id"], e["id"], e["id"], toggle[1], toggle[0],
+                e["id"], 'disabled title="Students have attempted this exam"' if locked else "", e["id"]))
+    notice = '<div class="notice">Saved.</div>' if request.args.get("saved") else ""
+    table = ('<div style="overflow-x:auto"><table class="tbl"><tr><th>Exam</th><th>Questions</th><th>Marks</th>'
+             '<th>Duration</th><th>Status</th><th>Attempts</th><th>Actions</th></tr>%s</table></div>' % "".join(rows)
+             if rows else '<div class="card">No exams yet. Create the first one.</div>')
+    script = """<script>
+function examAction(id, action, value) {
+    var url, method = "POST", body = null;
+    if (action === "status") { url = "/api/teacher/exams/" + id + "/status"; body = JSON.stringify({status: value}); }
+    else if (action === "duplicate") { url = "/api/teacher/exams/" + id + "/duplicate"; }
+    else if (action === "delete") {
+        if (!confirm("Delete this exam and all its questions? This cannot be undone.")) return;
+        url = "/api/teacher/exams/" + id; method = "DELETE";
+    }
+    fetch(url, {method: method, headers: {"Content-Type": "application/json"}, body: body})
+        .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+        .then(function (res) {
+            if (res.ok && res.j.ok) { window.location.href = "/teacher/exams?saved=1"; }
+            else { alert((res.j.errors || [res.j.error || "Something went wrong."]).join("\\n")); }
+        })
+        .catch(function () { alert("Could not reach the server."); });
+}
+</script>"""
+    content = teacher_navbar() + EXAM_ADMIN_CSS + """
+<main class="container">
+    <section class="hero"><h1>Exams</h1><p>Create exams, publish them to students, and review results.</p></section>
+    %s
+    <p><a class="btn" href="/teacher/exams/new">➕ Create exam</a>
+       <a class="btn secondary" href="/teacher/dashboard">← Dashboard</a></p>
+    %s
+</main>""" % (notice, table)
+    return page("Exams", content, script)
+
+
+# ----------------------------------------------------------------- editor
+EXAM_EDITOR_JS = r"""<script>
+(function () {
+    var boot = JSON.parse(document.getElementById("examData").textContent);
+    var state = boot.exam, locked = boot.locked, creating = boot.creating;
+    var keyTouched = !creating;
+    var root = document.getElementById("questions");
+
+    function el(tag, cls, text) {
+        var e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text !== undefined) e.textContent = text;
+        return e;
+    }
+    function input(type, value, onInput, placeholder) {
+        var i = document.createElement("input");
+        i.type = type; i.className = "input"; i.value = value === undefined || value === null ? "" : value;
+        if (placeholder) i.placeholder = placeholder;
+        i.addEventListener("input", function () { onInput(i.value); });
+        return i;
+    }
+    function slugify(text) {
+        return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+    }
+    function blank(type) {
+        if (type === "mcq") return {type: "mcq", text: "", marks: 2, options: [{text: "", correct: true}, {text: "", correct: false}, {text: "", correct: false}, {text: "", correct: false}]};
+        if (type === "tf") return {type: "tf", text: "", marks: 1, answer: "true"};
+        if (type === "match") return {type: "match", text: "", marks: 4, pairs: [{left: "", right: ""}, {left: "", right: ""}, {left: "", right: ""}]};
+        return {type: "short", text: "", marks: 4, answer: ""};
+    }
+    var typeNames = {mcq: "Multiple choice", tf: "True / False", match: "Matching", short: "Short answer (marked by you)"};
+
+    function render() {
+        root.innerHTML = "";
+        state.questions.forEach(function (q, n) {
+            var card = el("div", "card qcard");
+            var head = el("div", "qhead");
+            head.appendChild(el("b", "", "Question " + (n + 1)));
+            head.appendChild(el("span", "badge b-grey", typeNames[q.type]));
+            var tools = el("span", "qtools");
+            [["↑", -1], ["↓", 1]].forEach(function (m) {
+                var b = el("button", "btn small secondary", m[0]); b.type = "button";
+                b.onclick = function () {
+                    var to = n + m[1];
+                    if (to < 0 || to >= state.questions.length) return;
+                    var t = state.questions[n]; state.questions[n] = state.questions[to]; state.questions[to] = t; render();
+                };
+                tools.appendChild(b);
+            });
+            var del = el("button", "btn small danger", "Remove"); del.type = "button";
+            del.onclick = function () { state.questions.splice(n, 1); render(); };
+            tools.appendChild(del);
+            head.appendChild(tools);
+            card.appendChild(head);
+
+            var marks = el("label", "", "Marks "); 
+            marks.appendChild(input("number", q.marks, function (v) { q.marks = parseInt(v, 10) || 0; }));
+            card.appendChild(marks);
+            card.appendChild(el("label", "", "Question text"));
+            var ta = document.createElement("textarea"); ta.className = "input"; ta.rows = 2; ta.value = q.text;
+            ta.addEventListener("input", function () { q.text = ta.value; });
+            card.appendChild(ta);
+
+            if (q.type === "mcq") {
+                card.appendChild(el("label", "", "Options (select the correct one)"));
+                q.options.forEach(function (o, oi) {
+                    var row = el("div", "optrow");
+                    var radio = document.createElement("input"); radio.type = "radio"; radio.name = "correct" + n; radio.checked = !!o.correct;
+                    radio.onchange = function () { q.options.forEach(function (x) { x.correct = false; }); o.correct = true; };
+                    row.appendChild(radio);
+                    row.appendChild(input("text", o.text, function (v) { o.text = v; }, "Option " + (oi + 1)));
+                    var rm = el("button", "btn small secondary", "✕"); rm.type = "button";
+                    rm.onclick = function () { q.options.splice(oi, 1); if (!q.options.some(function (x) { return x.correct; }) && q.options.length) q.options[0].correct = true; render(); };
+                    row.appendChild(rm);
+                    card.appendChild(row);
+                });
+                if (q.options.length < 8) {
+                    var add = el("button", "btn small secondary", "+ Add option"); add.type = "button";
+                    add.onclick = function () { q.options.push({text: "", correct: false}); render(); };
+                    card.appendChild(add);
+                }
+            } else if (q.type === "tf") {
+                card.appendChild(el("label", "", "Correct answer"));
+                ["true", "false"].forEach(function (v) {
+                    var lab = el("label", "optrow");
+                    var radio = document.createElement("input"); radio.type = "radio"; radio.name = "tf" + n; radio.checked = q.answer === v;
+                    radio.onchange = function () { q.answer = v; };
+                    lab.appendChild(radio); lab.appendChild(document.createTextNode(v === "true" ? " True" : " False"));
+                    card.appendChild(lab);
+                });
+            } else if (q.type === "match") {
+                card.appendChild(el("label", "", "Pairs (left item  →  its correct right item). Students see the right-hand items shuffled."));
+                q.pairs.forEach(function (p, pi) {
+                    var row = el("div", "optrow");
+                    row.appendChild(input("text", p.left, function (v) { p.left = v; }, "Left item"));
+                    row.appendChild(el("span", "", "→"));
+                    row.appendChild(input("text", p.right, function (v) { p.right = v; }, "Right item"));
+                    var rm = el("button", "btn small secondary", "✕"); rm.type = "button";
+                    rm.onclick = function () { q.pairs.splice(pi, 1); render(); };
+                    row.appendChild(rm);
+                    card.appendChild(row);
+                });
+                if (q.pairs.length < 8) {
+                    var addp = el("button", "btn small secondary", "+ Add pair"); addp.type = "button";
+                    addp.onclick = function () { q.pairs.push({left: "", right: ""}); render(); };
+                    card.appendChild(addp);
+                }
+            } else {
+                card.appendChild(el("label", "", "Model answer (only for you, to help when marking)"));
+                var ma = document.createElement("textarea"); ma.className = "input"; ma.rows = 2; ma.value = q.answer || "";
+                ma.addEventListener("input", function () { q.answer = ma.value; });
+                card.appendChild(ma);
+            }
+            root.appendChild(card);
+        });
+        document.getElementById("qcount").textContent = state.questions.length + (state.questions.length === 1 ? " question" : " questions");
+    }
+
+    function renderLocked() {
+        root.innerHTML = "";
+        state.questions.forEach(function (q, n) {
+            var card = el("div", "card");
+            card.appendChild(el("b", "", "Question " + (n + 1) + " · " + typeNames[q.type] + " · " + q.marks + " marks"));
+            card.appendChild(el("p", "", q.text));
+            root.appendChild(card);
+        });
+    }
+
+    function showErrors(list) {
+        var box = document.getElementById("errors");
+        box.innerHTML = "";
+        if (!list || !list.length) { box.style.display = "none"; return; }
+        box.style.display = "block";
+        list.forEach(function (m) { box.appendChild(el("div", "", "• " + m)); });
+        window.scrollTo({top: box.offsetTop - 20, behavior: "smooth"});
+    }
+
+    function bind(id, key, transform) {
+        var node = document.getElementById(id);
+        node.value = state[key] === undefined || state[key] === null ? "" : state[key];
+        node.addEventListener("input", function () { state[key] = transform ? transform(node.value) : node.value; });
+        return node;
+    }
+    var titleNode = bind("f_title", "title");
+    var keyNode = bind("f_key", "key");
+    bind("f_duration", "duration_minutes", function (v) { return parseInt(v, 10) || 0; });
+    bind("f_status", "status");
+    if (creating) {
+        keyNode.addEventListener("input", function () { keyTouched = true; });
+        titleNode.addEventListener("input", function () { if (!keyTouched) { state.key = slugify(titleNode.value); keyNode.value = state.key; } });
+    } else { keyNode.readOnly = true; }
+
+    if (locked) {
+        document.getElementById("f_duration").readOnly = true;
+        renderLocked();
+        document.getElementById("addbar").style.display = "none";
+    } else {
+        document.querySelectorAll("[data-add]").forEach(function (b) {
+            b.onclick = function () { state.questions.push(blank(b.getAttribute("data-add"))); render(); };
+        });
+        render();
+    }
+
+    document.getElementById("saveBtn").onclick = function () {
+        var btn = this; btn.disabled = true;
+        var url = creating ? "/api/teacher/exams" : "/api/teacher/exams/" + state.id;
+        fetch(url, {method: creating ? "POST" : "PUT", headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({title: state.title, key: state.key, duration_minutes: state.duration_minutes,
+                                          status: state.status, questions: state.questions})})
+            .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+            .then(function (res) {
+                if (res.ok && res.j.ok) { window.location.href = "/teacher/exams?saved=1"; return; }
+                btn.disabled = false;
+                showErrors(res.j.errors || [res.j.error || "Could not save."]);
+            })
+            .catch(function () { btn.disabled = false; showErrors(["Could not reach the server."]); });
+    };
+})();
+</script>"""
+
+
+def exam_editor_page(exam, creating, locked):
+    esc = htmllib.escape
+    payload = {"exam": exam, "creating": creating, "locked": locked}
+    # Every "<" becomes \u003c, so nothing in an exam title or question can ever open or
+    # close a tag (or an HTML comment) inside this JSON block; the browser still reads the same text.
+    data = (json.dumps(payload, ensure_ascii=False)
+            .replace("<", "\\u003c").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+    title = "Create exam" if creating else "Edit exam"
+    banner = ""
+    if locked:
+        banner = ('<div class="warnbox"><b>Students have already attempted this exam.</b> To keep their answers meaningful, '
+                  'only the title and status can change now. To change the questions, use <b>Duplicate</b> on the exams list '
+                  'and edit the copy.</div>')
+    content = teacher_navbar() + EXAM_ADMIN_CSS + """<style>
+.qcard { margin:14px 0; } .qhead { display:flex; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap; }
+.qtools { margin-left:auto; display:flex; gap:6px; } .optrow { display:flex; align-items:center; gap:8px; margin:6px 0; }
+.optrow .input { flex:1; } textarea.input { width:100%%; box-sizing:border-box; font-family:inherit; }
+.fieldgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; }
+.addbar { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 20px; }
+</style>
+<main class="container">
+    <section class="hero"><h1>%s</h1><p>Questions are scored automatically, except short answers which you mark by hand.</p></section>
+    %s
+    <div id="errors" class="errbox" style="display:none"></div>
+    <div class="card">
+        <div class="fieldgrid">
+            <div><label>Title</label><input id="f_title" class="input" maxlength="200"></div>
+            <div><label>Exam key (used in the link, cannot change later)</label><input id="f_key" class="input" maxlength="50" placeholder="database-midterm"></div>
+            <div><label>Duration (minutes)</label><input id="f_duration" class="input" type="number" min="1" max="600"></div>
+            <div><label>Status</label><select id="f_status" class="input"><option value="draft">Draft (hidden from students)</option><option value="published">Published</option></select></div>
+        </div>
+    </div>
+    <h2 class="section-title">Questions <small id="qcount"></small></h2>
+    <div id="questions"></div>
+    <div id="addbar" class="addbar">
+        <button type="button" class="btn secondary" data-add="mcq">+ Multiple choice</button>
+        <button type="button" class="btn secondary" data-add="tf">+ True / False</button>
+        <button type="button" class="btn secondary" data-add="match">+ Matching</button>
+        <button type="button" class="btn secondary" data-add="short">+ Short answer</button>
+    </div>
+    <p><button id="saveBtn" class="btn" type="button">💾 Save exam</button>
+       <a class="btn secondary" href="/teacher/exams">Cancel</a></p>
+    <script type="application/json" id="examData">%s</script>
+</main>""" % (esc(title), banner, data)
+    return page(title, content, EXAM_EDITOR_JS)
+
+
+@app.route("/teacher/exams/new")
+def teacher_exam_new():
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    exam = {"id": None, "key": "", "title": "", "duration_minutes": 30, "status": "draft",
+            "questions": [{"type": "mcq", "text": "", "marks": 2,
+                           "options": [{"text": "", "correct": True}, {"text": "", "correct": False},
+                                       {"text": "", "correct": False}, {"text": "", "correct": False}]}]}
+    return exam_editor_page(exam, creating=True, locked=False)
+
+
+def exam_for_editor(full):
+    """Teacher-side JSON of an exam (includes answer keys; never sent to students)."""
+    questions = []
+    for q in full["questions"]:
+        item = {"type": q["type"], "text": q["text"], "marks": q["marks"]}
+        if q["type"] == "mcq":
+            item["options"] = q["options"]
+        elif q["type"] == "match":
+            item["pairs"] = q["pairs"]
+        else:
+            item["answer"] = q["answer"] or ""
+        questions.append(item)
+    return {"id": full["id"], "key": full["key"], "title": full["title"],
+            "duration_minutes": full["duration_minutes"], "status": full["status"], "questions": questions}
+
+
+@app.route("/teacher/exams/<int:exam_id>/edit")
+def teacher_exam_edit(exam_id):
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
     conn = get_db()
+    full = eb.get_exam_full(conn, exam_id)
+    if not full:
+        return "Exam not found.", 404
+    locked = eb.attempt_count(conn, full["key"]) > 0
+    return exam_editor_page(exam_for_editor(full), creating=False, locked=locked)
+
+
+# -------------------------------------------------------------- exam APIs
+@app.route("/api/teacher/exams", methods=["POST"])
+def api_exam_create():
+    auth_error = teacher_api_required()
+    if auth_error:
+        return auth_error
+    clean, errors = eb.validate_exam(request.get_json(silent=True), creating=True)
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 400
+    try:
+        exam_id = eb.create_exam(get_db(), clean, session["user_id"])
+    except ValueError as exc:
+        return jsonify({"ok": False, "errors": [str(exc)]}), 409
+    except Exception:
+        app.logger.exception("Could not create exam")
+        return jsonify({"ok": False, "errors": ["The exam could not be saved. Please try again."]}), 500
+    return jsonify({"ok": True, "id": exam_id})
+
+
+@app.route("/api/teacher/exams/<int:exam_id>", methods=["PUT", "DELETE"])
+def api_exam_update_or_delete(exam_id):
+    auth_error = teacher_api_required()
+    if auth_error:
+        return auth_error
+    conn = get_db()
+    exam = eb.get_exam_by_id(conn, exam_id)
+    if not exam:
+        return jsonify({"ok": False, "errors": ["Exam not found."]}), 404
+    try:
+        if request.method == "DELETE":
+            message = eb.delete_exam(conn, exam)
+            if message:
+                return jsonify({"ok": False, "errors": [message]}), 409
+            return jsonify({"ok": True})
+        locked = eb.attempt_count(conn, exam["key"]) > 0
+        clean, errors = eb.validate_exam(request.get_json(silent=True), creating=False, content_locked=locked)
+        if errors:
+            return jsonify({"ok": False, "errors": errors}), 400
+        eb.update_exam(conn, exam, clean, locked)
+        return jsonify({"ok": True, "content_locked": locked})
+    except Exception:
+        app.logger.exception("Could not change exam")
+        return jsonify({"ok": False, "errors": ["The change could not be saved. Please try again."]}), 500
+
+
+@app.route("/api/teacher/exams/<int:exam_id>/status", methods=["POST"])
+def api_exam_status(exam_id):
+    auth_error = teacher_api_required()
+    if auth_error:
+        return auth_error
+    conn = get_db()
+    exam = eb.get_exam_by_id(conn, exam_id)
+    if not exam:
+        return jsonify({"ok": False, "errors": ["Exam not found."]}), 404
+    message = eb.set_status(conn, exam, str((request.get_json(silent=True) or {}).get("status", "")))
+    if message:
+        return jsonify({"ok": False, "errors": [message]}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/teacher/exams/<int:exam_id>/duplicate", methods=["POST"])
+def api_exam_duplicate(exam_id):
+    auth_error = teacher_api_required()
+    if auth_error:
+        return auth_error
+    try:
+        new_id = eb.duplicate_exam(get_db(), exam_id, session["user_id"])
+    except Exception:
+        app.logger.exception("Could not duplicate exam")
+        return jsonify({"ok": False, "errors": ["The exam could not be duplicated."]}), 500
+    if new_id is None:
+        return jsonify({"ok": False, "errors": ["Exam not found."]}), 404
+    return jsonify({"ok": True, "id": new_id})
+
+
+# ---------------------------------------------------------------- results
+@app.route("/teacher/exams/<int:exam_id>/results")
+def teacher_exam_results(exam_id):
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    conn = get_db()
+    exam = eb.get_exam_by_id(conn, exam_id)
+    if not exam:
+        return "Exam not found.", 404
+    esc = htmllib.escape
+    subs = eb.list_submissions(conn, exam["key"])
+    rows = []
+    for s in subs:
+        pending = ' <span class="badge b-amber">%d to mark</span>' % s["pending"] if s["pending"] else ""
+        rows.append(
+            "<tr><td>%s</td><td>%s</td><td>%s</td><td><b>%s</b>%s</td><td>%d</td><td>%s</td><td>%s</td>"
+            '<td><a class="btn small" href="/teacher/submissions/%d">Review</a></td></tr>' % (
+                esc(str(s["username"])), esc(str(s["name"])), status_badge(s["status"]),
+                esc(fmt_score(s["score"], s["max_score"])), pending, s["warnings"],
+                esc(format_minute(s["elapsed"])), esc(str(s["submitted_at"])), s["id"]))
+    table = ('<div style="overflow-x:auto"><table class="tbl"><tr><th>Student index</th><th>Name</th><th>Status</th>'
+             '<th>Score</th><th>Warnings</th><th>Time taken</th><th>Submitted</th><th></th></tr>%s</table></div>' % "".join(rows)
+             if rows else '<div class="card">No submissions yet.</div>')
+    scored = [s["score"] for s in subs if s["score"] is not None]
+    summary = ""
+    if scored:
+        summary = ('<p><b>%d</b> submissions · average score <b>%.1f</b> · highest <b>%g</b> · lowest <b>%g</b> '
+                   '(scores of short answers not yet marked are not included in the totals)</p>' % (
+                       len(subs), sum(scored) / len(scored), max(scored), min(scored)))
+    content = teacher_navbar() + EXAM_ADMIN_CSS + """
+<main class="container">
+    <section class="hero"><h1>%s — results</h1><p>Automatic marks are added at submission; short answers are marked by you.</p></section>
+    %s
+    <p><a class="btn" href="/teacher/exams/%d/results.csv">⬇ Download CSV</a>
+       <a class="btn secondary" href="/teacher/exams">← Exams</a></p>
+    %s
+</main>""" % (esc(exam["title"]), summary, exam["id"], table)
+    return page("Results", content)
+
+
+@app.route("/teacher/exams/<int:exam_id>/results.csv")
+def teacher_exam_results_csv(exam_id):
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    conn = get_db()
+    exam = eb.get_exam_by_id(conn, exam_id)
+    if not exam:
+        return "Exam not found.", 404
+    rows = [[s["username"], s["name"], s["status"], "" if s["score"] is None else s["score"],
+             "" if s["max_score"] is None else s["max_score"], s["pending"], s["warnings"],
+             s["elapsed"], s["submitted_at"]] for s in eb.list_submissions(conn, exam["key"])]
+    return csv_response("%s-results.csv" % exam["key"],
+                        ["student_index", "name", "status", "score", "max_score", "short_answers_to_mark",
+                         "warnings", "seconds_taken", "submitted_at"], rows)
+
+
+def describe_answer(q, answer):
+    """Readable text of what the student answered."""
+    if answer is None or answer == "" or answer == {}:
+        return "(no answer)"
+    if q["type"] == "mcq":
+        try:
+            return q["options"][int(answer)]["text"]
+        except (TypeError, ValueError, IndexError):
+            return "(invalid answer)"
+    if q["type"] == "tf":
+        return str(answer).title()
+    if q["type"] == "match" and isinstance(answer, dict):
+        order = eb.match_order(q)
+        shown = [q["pairs"][i]["right"] for i in order]
+        lines = []
+        for li, pair in enumerate(q["pairs"]):
+            chosen = eb._as_int(answer.get(str(li)))
+            lines.append("%s → %s" % (pair["left"], shown[chosen] if chosen is not None and 0 <= chosen < len(shown) else "(none)"))
+        return "\n".join(lines)
+    return str(answer)
+
+
+def describe_key(q):
+    if q["type"] == "mcq":
+        return next((o["text"] for o in q["options"] if o["correct"]), "")
+    if q["type"] == "tf":
+        return str(q["answer"]).title()
+    if q["type"] == "match":
+        return "\n".join("%s → %s" % (p["left"], p["right"]) for p in q["pairs"])
+    return q["answer"] or "(no model answer)"
+
+
+@app.route("/teacher/submissions/<int:submission_id>")
+def teacher_submission(submission_id):
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    conn = get_db()
+    sub = eb.get_submission(conn, submission_id)
+    if not sub:
+        return "Submission not found.", 404
+    exam = eb.get_exam_by_key(conn, sub["exam_key"])
+    esc = htmllib.escape
+    questions = eb.load_questions(conn, exam["id"]) if exam else []
+    try:
+        answers = json.loads(sub["answers"]) if sub["answers"] else {}
+    except ValueError:
+        answers = {}
+    result = eb.score_answers(questions, answers)
+    grades = eb.get_grades(conn, submission_id)
+    manual_total = sum(grades.values())
+    total = result["auto_score"] + manual_total
+    blocks = []
+    for number, q in enumerate(questions, start=1):
+        info = result["detail"][q["id"]]
+        shown = describe_answer(q, answers.get("q%d" % q["id"]))
+        if q["type"] == "short":
+            current = grades.get(q["id"])
+            verdict = (
+                'Marks: <input class="input markbox" type="number" min="0" max="%d" step="0.5" data-q="%d" value="%s" '
+                'style="width:90px;display:inline-block"> / %d' % (
+                    q["marks"], q["id"], "" if current is None else ("%g" % current), q["marks"]))
+        else:
+            label = {"correct": ("b-green", "Correct"), "partial": ("b-amber", "Partly correct"),
+                     "wrong": ("b-red", "Wrong"), "unanswered": ("b-grey", "No answer")}[info["status"]]
+            verdict = '<span class="badge %s">%s</span> %g / %d' % (label[0], label[1], info["awarded"], q["marks"])
+        blocks.append(
+            '<div class="card" style="margin:12px 0"><b>Question %d</b> · %s<p>%s</p>'
+            '<p><small>Student answer</small></p><pre style="white-space:pre-wrap;margin:0 0 8px">%s</pre>'
+            '<p><small>%s</small></p><pre style="white-space:pre-wrap;margin:0 0 8px;color:#067647">%s</pre>'
+            "<div>%s</div></div>" % (
+                number, esc(q["type"].upper()), esc(q["text"]), esc(shown),
+                "Model answer" if q["type"] == "short" else "Correct answer", esc(describe_key(q)), verdict))
+    pending = sum(1 for q in questions if q["type"] == "short" and result["detail"][q["id"]]["status"] == "needs_grading"
+                  and q["id"] not in grades)
+    script = """<script>
+document.getElementById("saveGrades").onclick = function () {
+    var grades = {};
+    document.querySelectorAll(".markbox").forEach(function (b) { grades[b.getAttribute("data-q")] = b.value; });
+    var btn = this; btn.disabled = true;
+    fetch("/api/teacher/submissions/%d/grades", {method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({grades: grades})})
+        .then(function (r) { return r.json().then(function (j) { return {ok: r.ok, j: j}; }); })
+        .then(function (res) {
+            btn.disabled = false;
+            if (res.ok && res.j.ok) { window.location.reload(); }
+            else { alert((res.j.errors || ["Could not save."]).join("\\n")); }
+        })
+        .catch(function () { btn.disabled = false; alert("Could not reach the server."); });
+};
+</script>""" % submission_id
+    has_short = any(q["type"] == "short" for q in questions)
+    content = teacher_navbar() + EXAM_ADMIN_CSS + """
+<main class="container">
+    <section class="hero"><h1>%s</h1><p>%s · index %s · %s</p></section>
+    <div class="card"><p>Score: <b>%s</b> (automatic %g + marked by hand %g) %s</p></div>
+    %s
+    %s
+    <p><a class="btn secondary" href="/teacher/exams/%d/results">← Results</a></p>
+</main>""" % (
+        esc(str(sub["name"])), esc(exam["title"] if exam else sub["exam_key"]), esc(str(sub["username"])),
+        status_badge(sub["status"]), esc(fmt_score(total, result["max_score"])), result["auto_score"], manual_total,
+        ('<span class="badge b-amber">%d short answer(s) still to mark</span>' % pending) if pending else "",
+        "".join(blocks),
+        '<p><button id="saveGrades" class="btn" type="button">💾 Save marks</button></p>' if has_short else "",
+        exam["id"] if exam else 0)
+    return page("Submission", content, script if has_short else "")
+
+
+@app.route("/api/teacher/submissions/<int:submission_id>/grades", methods=["POST"])
+def api_save_grades(submission_id):
+    auth_error = teacher_api_required()
+    if auth_error:
+        return auth_error
+    conn = get_db()
+    sub = eb.get_submission(conn, submission_id)
+    exam = eb.get_exam_by_key(conn, sub["exam_key"]) if sub else None
+    if not sub or not exam:
+        return jsonify({"ok": False, "errors": ["Submission not found."]}), 404
+    errors = eb.save_grades(conn, submission_id, eb.load_questions(conn, exam["id"]),
+                            (request.get_json(silent=True) or {}).get("grades"), session["user_id"])
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 400
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------- behavior reports
+REPORT_PAGE_SIZE = 15
+
+
+def report_records(conn):
+    """One record per exam attempt that has logged events, with its risk summary."""
+    from risk_analytics import summarize, split_attempts
+    from collections import defaultdict
     cursor = conn.cursor(buffered=True)
     cursor.execute(
         """SELECT id, exam_title, user_id, username, student_name, event_type,
@@ -2730,82 +3354,154 @@ def teacher_reports():
     )
     rows = cursor.fetchall()
     cursor.close()
-
     groups = defaultdict(list)
     for event_id, exam, uid, username, name, etype, reason, wnum, elapsed, created in rows:
         groups[(exam, uid, username, name)].append({
             "id": event_id, "event_type": etype, "reason": reason,
-            "warning_number": wnum, "elapsed_seconds": elapsed,
-            "created_at": created,
-        })
-
-    esc = htmllib.escape
-    cards = []
-    exam_summary = defaultdict(lambda: {"attempts": 0, "review": 0, "warnings": 0, "risks": []})
+            "warning_number": wnum, "elapsed_seconds": elapsed, "created_at": created})
+    records = []
     for (exam, uid, username, name), events in groups.items():
         for attempt_number, attempt in enumerate(split_attempts(events), 1):
-            stats = summarize(attempt)
-            summary = exam_summary[exam]
-            summary["attempts"] += 1
-            summary["warnings"] += stats["warnings"]
-            summary["risks"].append(stats["risk"])
-            if stats["level"] != "Low": summary["review"] += 1
-            color = {"High": "#b42318", "Moderate": "#9a5b00", "Low": "#067647"}[stats["level"]]
-            count_text = ", ".join(
-                f"{key.replace('_', ' ').title()}: {value}"
-                for key, value in sorted(stats["counts"].items())
-            ) or "No warnings logged"
-            event_rows = []
-            for event in attempt:
-                label = event["event_type"].title()
-                event_rows.append(
-                    "<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                        esc(format_minute(event["elapsed_seconds"])),
-                        esc(label), esc(str(event["reason"]))))
-            cards.append((stats["risk"],
-                '<div class="card" style="margin:14px 0;">'
-                '<h3>%s — %s (attempt %d)</h3>'
-                '<p>Student index: <b>%s</b></p>'
-                '<p><b style="color:%s">%s review priority</b> · Risk: <b>%d/100</b> · Trust: <b>%d/100</b> · Warnings: %d%s</p>'
-                '<p>Detected event categories: %s</p>'
-                '<div style="overflow-x:auto"><table style="width:100%%;border-collapse:collapse;" border="1" cellpadding="7">'
-                '<tr><th>Elapsed time</th><th>Event</th><th>Reason</th></tr>%s</table></div></div>' % (
-                    esc(exam), esc(str(name)), attempt_number, esc(str(username)),
-                    color, stats["level"], stats["risk"], stats["trust"],
-                    stats["warnings"], " · Terminated" if stats["terminated"] else "",
-                    esc(count_text), "".join(event_rows))))
+            records.append({"exam": exam, "uid": uid, "username": str(username), "name": str(name),
+                            "attempt_number": attempt_number, "events": attempt, "stats": summarize(attempt)})
+    return records
 
-    summary_rows = []
-    for exam, info in sorted(exam_summary.items()):
-        avg = sum(info["risks"]) / len(info["risks"])
-        summary_rows.append(
-            "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%.1f</td></tr>" % (
-                esc(exam), info["attempts"], info["review"],
-                info["warnings"], avg))
+
+def filter_report_records(records, args):
+    exam = args.get("exam", "").strip()
+    level = args.get("level", "").strip()
+    query = args.get("q", "").strip().lower()
+    out = []
+    for r in records:
+        if exam and r["exam"] != exam:
+            continue
+        if level in ("High", "Moderate", "Low") and r["stats"]["level"] != level:
+            continue
+        if query and query not in r["username"].lower() and query not in r["name"].lower():
+            continue
+        out.append(r)
+    return sorted(out, key=lambda r: -r["stats"]["risk"])
+
+
+def report_card(r):
+    esc = htmllib.escape
+    stats = r["stats"]
+    color = {"High": "#b42318", "Moderate": "#9a5b00", "Low": "#067647"}[stats["level"]]
+    count_text = ", ".join("%s: %d" % (k.replace("_", " ").title(), v) for k, v in sorted(stats["counts"].items())) \
+        or "No warnings logged"
+    event_rows = "".join(
+        "<tr><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            esc(format_minute(e["elapsed_seconds"])), esc(e["event_type"].title()), esc(str(e["reason"])))
+        for e in r["events"])
+    return (
+        '<div class="card" style="margin:14px 0;">'
+        "<h3>%s — %s (attempt %d)</h3>"
+        "<p>Student index: <b>%s</b></p>"
+        '<p><b style="color:%s">%s review priority</b> · Risk: <b>%d/100</b> · Trust: <b>%d/100</b> · Warnings: %d%s</p>'
+        "<p>Detected event categories: %s</p>"
+        '<div style="overflow-x:auto"><table style="width:100%%;border-collapse:collapse;" border="1" cellpadding="7">'
+        "<tr><th>Elapsed time</th><th>Event</th><th>Reason</th></tr>%s</table></div></div>" % (
+            esc(r["exam"]), esc(r["name"]), r["attempt_number"], esc(r["username"]),
+            color, stats["level"], stats["risk"], stats["trust"], stats["warnings"],
+            " · Terminated" if stats["terminated"] else "", esc(count_text), event_rows))
+
+
+@app.route("/teacher/reports")
+def teacher_reports():
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    from urllib.parse import urlencode
+    from collections import defaultdict
+    esc = htmllib.escape
+    all_records = report_records(get_db())
+    records = filter_report_records(all_records, request.args)
+
+    try:
+        page_number = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        page_number = 1
+    pages = max(1, -(-len(records) // REPORT_PAGE_SIZE))
+    page_number = min(page_number, pages)
+    shown = records[(page_number - 1) * REPORT_PAGE_SIZE: page_number * REPORT_PAGE_SIZE]
+
+    summary = defaultdict(lambda: {"attempts": 0, "review": 0, "warnings": 0, "risks": []})
+    for r in records:
+        s = summary[r["exam"]]
+        s["attempts"] += 1
+        s["warnings"] += r["stats"]["warnings"]
+        s["risks"].append(r["stats"]["risk"])
+        if r["stats"]["level"] != "Low":
+            s["review"] += 1
+    summary_rows = "".join(
+        "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%.1f</td></tr>" % (
+            esc(exam), info["attempts"], info["review"], info["warnings"], sum(info["risks"]) / len(info["risks"]))
+        for exam, info in sorted(summary.items()))
     overview = (
-        '<div class="card"><h2>Examination overview</h2>'
-        '<div style="overflow-x:auto"><table border="1" cellpadding="8" style="width:100%%;border-collapse:collapse">'
-        '<tr><th>Exam</th><th>Logged attempts</th><th>Review suggested</th><th>Warnings</th><th>Average risk</th></tr>%s'
-        '</table></div></div>' % "".join(summary_rows)
-        if summary_rows else '<div class="card">No behavior events have been logged yet.</div>'
-    )
-    body = "".join(card for _, card in sorted(cards, key=lambda item: -item[0]))
+        '<div class="card"><h2>Examination overview</h2><div style="overflow-x:auto">'
+        '<table border="1" cellpadding="8" style="width:100%%;border-collapse:collapse">'
+        "<tr><th>Exam</th><th>Logged attempts</th><th>Review suggested</th><th>Warnings</th><th>Average risk</th></tr>%s"
+        "</table></div></div>" % summary_rows
+        if summary_rows else '<div class="card">No behavior events match these filters.</div>')
+
+    exam_names = sorted({r["exam"] for r in all_records})
+    current = {k: request.args.get(k, "") for k in ("exam", "level", "q")}
+    exam_options = '<option value="">All exams</option>' + "".join(
+        '<option value="%s"%s>%s</option>' % (esc(n, True), " selected" if n == current["exam"] else "", esc(n))
+        for n in exam_names)
+    level_options = "".join(
+        '<option value="%s"%s>%s</option>' % (v, " selected" if v == current["level"] else "", t)
+        for v, t in (("", "All levels"), ("High", "High"), ("Moderate", "Moderate"), ("Low", "Low")))
+    filters = (
+        '<form method="GET" class="card" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end">'
+        '<div><label>Exam</label><select name="exam" class="input">%s</select></div>'
+        '<div><label>Review priority</label><select name="level" class="input">%s</select></div>'
+        '<div><label>Student (index or name)</label><input name="q" class="input" value="%s"></div>'
+        '<button class="btn" type="submit">Filter</button>'
+        '<a class="btn secondary" href="/teacher/reports">Clear</a>'
+        '<a class="btn secondary" href="/teacher/reports.csv?%s">⬇ CSV</a></form>' % (
+            exam_options, level_options, esc(current["q"], True), esc(urlencode({k: v for k, v in current.items() if v}))))
+
+    def link(n, text):
+        params = {k: v for k, v in current.items() if v}
+        params["page"] = n
+        return '<a class="btn small secondary" href="/teacher/reports?%s">%s</a>' % (esc(urlencode(params)), text)
+    pager = ""
+    if pages > 1:
+        pager = '<p style="display:flex;gap:8px;align-items:center">%s<span>Page %d of %d</span>%s</p>' % (
+            link(page_number - 1, "← Previous") if page_number > 1 else "", page_number, pages,
+            link(page_number + 1, "Next →") if page_number < pages else "")
+
     content = (
-        '<nav class="navbar"><a href="/teacher/dashboard" class="brand">Secure Exam Platform</a>'
-        '<a href="/logout">Logout</a></nav><main class="container">'
+        teacher_navbar() + '<main class="container">'
         '<section class="hero"><h1>Behavior Analysis &amp; Risk Dashboard</h1>'
-        '<p>Review priorities based on recorded events, not evidence of cheating.</p></section>'
+        "<p>Review priorities based on recorded events, not evidence of cheating.</p></section>"
         '<div class="card"><p><b>Interpretation:</b> Risk is a provisional weighted warning index (0–100); '
-        'Trust = 100 − Risk. These are not probabilities or verified measures of honesty. '
-        'Low: 0–24; Moderate: 25–59; High: 60–100. '
-        'Face absence +10, head turned +5, multiple faces +25, tab/window change +15, '
-        'browser action +10, other warning +5. Termination sets a minimum risk of 80. '
-        'Teachers must review events and context before taking action. '
-        'Scores reflect only successfully logged events.</p></div>'
-        + overview + '<h2 class="section-title">Student attempts — highest risk first</h2>' + body +
-        '<p><a class="btn" href="/teacher/dashboard">Back to dashboard</a></p></main>'
-    )
+        "Trust = 100 − Risk. These are not probabilities or verified measures of honesty. "
+        "Low: 0–24; Moderate: 25–59; High: 60–100. "
+        "Face absence +10, head turned +5, multiple faces +25, tab/window change +15, "
+        "browser action +10, other warning +5. Termination sets a minimum risk of 80. "
+        "Teachers must review events and context before taking action. "
+        "Scores reflect only successfully logged events.</p></div>"
+        + filters + overview
+        + '<h2 class="section-title">Student attempts — highest risk first (%d)</h2>' % len(records)
+        + "".join(report_card(r) for r in shown) + pager
+        + '<p><a class="btn" href="/teacher/dashboard">Back to dashboard</a></p></main>')
     return page("Behavior Analysis & Risk Dashboard", content)
+
+
+@app.route("/teacher/reports.csv")
+def teacher_reports_csv():
+    redirect_response = teacher_page_required()
+    if redirect_response:
+        return redirect_response
+    records = filter_report_records(report_records(get_db()), request.args)
+    rows = [[r["exam"], r["username"], r["name"], r["attempt_number"], r["stats"]["risk"], r["stats"]["trust"],
+             r["stats"]["level"], r["stats"]["warnings"], "yes" if r["stats"]["terminated"] else "no",
+             "; ".join("%s=%d" % (k, v) for k, v in sorted(r["stats"]["counts"].items()))] for r in records]
+    return csv_response("behavior-report.csv",
+                        ["exam", "student_index", "name", "attempt", "risk", "trust", "review_priority",
+                         "warnings", "terminated", "warning_categories"], rows)
 
 
 # Student profile/settings
