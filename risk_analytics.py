@@ -42,3 +42,44 @@ def split_attempts(events):
         current.append(event)
     if current: attempts.append(current)
     return attempts
+    
+def explain_risk(events):
+    """
+    Returns a transparent explanation of the risk score.
+    Does not change the existing score calculation.
+    """
+    result = summarize(events)
+
+    explanations = {
+        "multiple_faces": "More than one face detected",
+        "tab_switch": "Window or tab focus changed",
+        "browser_action": "Restricted browser interaction",
+        "face_absent": "Student face not detected",
+        "head_turned": "Sustained head movement",
+        "other": "Other monitoring warning",
+    }
+
+    factors = []
+
+    for category, count in result["counts"].items():
+        factors.append({
+            "category": category,
+            "description": explanations.get(category, category),
+            "count": count,
+            "weight": WEIGHTS.get(category, 0),
+            "contribution": count * WEIGHTS.get(category, 0),
+        })
+
+    return {
+        "risk": result["risk"],
+        "trust": result["trust"],
+        "level": result["level"],
+        "factors": factors,
+        "requires_human_review": (
+            result["level"] != "Low" or result["terminated"]
+        ),
+        "interpretation": (
+            "This is a provisional review-priority score, "
+            "not a probability of cheating or proof of misconduct."
+        )
+    }    
