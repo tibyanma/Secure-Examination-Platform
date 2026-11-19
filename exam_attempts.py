@@ -17,8 +17,14 @@ Rules enforced:
     attempt and writes a permanent lock (exam_locks), per student + exam.
   * Each attempt accepts exactly one submission (UNIQUE attempt_id), so
     duplicate or late browser requests cannot overwrite answers.
+  * Answers are autosaved to attempt_answers while the exam is open. A reload
+    restores them, and if the browser never submits, finalize_unsubmitted()
+    turns the last autosave into the submission.
 """
 
+import json
+import logging
+import re
 import time
 
 import mysql.connector
@@ -28,6 +34,14 @@ import exam_locks
 MAX_WARNINGS = 3            # warnings shown; the next violation terminates
 SUBMIT_GRACE_SECONDS = 120  # slow-network allowance after the deadline
 FACE_VERIFY_TTL_SECONDS = 15 * 60
+
+# Autosave limits (the exam editor allows at most 100 questions, 8 pairs, 3000-character answers).
+MAX_SAVED_QUESTIONS = 200
+MAX_SAVED_ANSWER_CHARS = 3000
+_QUESTION_ID = re.compile(r"^q[0-9]{1,9}$")
+_PAIR_INDEX = re.compile(r"^[0-9]{1,2}$")
+
+log = logging.getLogger(__name__)
 
 IN_PROGRESS = "in_progress"
 TERMINATED = "terminated"
@@ -68,6 +82,17 @@ def ensure_schema(db):
             reason VARCHAR(255) DEFAULT 'Terminated after 3 security warnings',
             locked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE KEY unique_user_exam (user_id, exam_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+    )
+    # One row per attempt holding the latest autosaved answers. `rev` only ever
+    # increases, so a slow request that arrives late cannot overwrite newer answers.
+    cursor.execute(
+        """CREATE TABLE IF NOT EXISTS attempt_answers (
+            attempt_id BIGINT NOT NULL PRIMARY KEY,
+            rev BIGINT NOT NULL DEFAULT 0,
+            answers LONGTEXT NOT NULL,
+            flagged TEXT NOT NULL,
+            updated_ts BIGINT NOT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
     )
     # Link existing tables to an attempt (older rows keep attempt_id NULL).
@@ -248,11 +273,13 @@ def add_warning(db, attempt):
 
 
 def save_submission(db, attempt, client_status, answers_json, student_name,
-                    username, exam_title, now=None):
+                    username, exam_title, now=None, auto_closed=False):
     """
     Stores the single submission allowed for this attempt.
     Returns (final_status, duplicate).  The status is decided by the server,
     not by the browser.
+    auto_closed=True: the server is closing an attempt the browser never submitted
+    (answers come from the last autosave), so it is recorded as 'time_up', not 'late'.
     """
     now = int(now if now is not None else time.time())
 
@@ -267,6 +294,9 @@ def save_submission(db, attempt, client_status, answers_json, student_name,
     if client_status == "terminated" or attempt["status"] == TERMINATED:
         final = "terminated"
         terminate_attempt(db, attempt, "Terminated after %d security warnings" % MAX_WARNINGS, now)
+    elif auto_closed:
+        final = attempt["status"] if attempt["status"] in ("time_up", "late", "submitted") else "time_up"
+        _finish(db, attempt["id"], "time_up", now)
     elif now > attempt["deadline_ts"] + SUBMIT_GRACE_SECONDS:
         final = "late"
         _finish(db, attempt["id"], "late", now)
@@ -297,6 +327,138 @@ def save_submission(db, attempt, client_status, answers_json, student_name,
     return final, False
 
 
+# -------------------------------------------------------------- autosave
+def clean_progress(answers, flagged):
+    """
+    Shape-checks what the browser sends before it is stored. Entries that are not a
+    valid answer are dropped; text is cut to the 3000-character limit.
+    Returns (answers_dict, flagged_list).
+    """
+    clean = {}
+    if isinstance(answers, dict):
+        for key, value in list(answers.items())[:MAX_SAVED_QUESTIONS]:
+            if not isinstance(key, str) or not _QUESTION_ID.match(key) or isinstance(value, bool):
+                continue
+            if isinstance(value, int):                      # mcq: option number
+                if 0 <= value < 1000:
+                    clean[key] = value
+            elif isinstance(value, str):                    # true/false and short answers
+                clean[key] = value[:MAX_SAVED_ANSWER_CHARS]
+            elif isinstance(value, dict):                   # matching: left number -> right number
+                pairs = {}
+                for left, right in list(value.items())[:8]:
+                    if (isinstance(left, str) and _PAIR_INDEX.match(left)
+                            and isinstance(right, int) and not isinstance(right, bool) and 0 <= right < 100):
+                        pairs[left] = right
+                clean[key] = pairs
+    flags = []
+    if isinstance(flagged, list):
+        for item in flagged[:MAX_SAVED_QUESTIONS]:
+            if isinstance(item, str) and _QUESTION_ID.match(item) and item not in flags:
+                flags.append(item)
+    return clean, flags
+
+
+def save_progress(db, attempt, rev, answers, flagged, now=None):
+    """
+    Autosave. Returns 'saved', 'stale' (a newer save already arrived; nothing changed)
+    or 'closed' (the attempt is over: submitted, terminated or past its deadline).
+    """
+    now = int(now if now is not None else time.time())
+    if attempt["status"] != IN_PROGRESS or now >= attempt["deadline_ts"] + SUBMIT_GRACE_SECONDS:
+        return "closed"
+    answers, flagged = clean_progress(answers, flagged)
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            "INSERT IGNORE INTO attempt_answers (attempt_id, rev, answers, flagged, updated_ts) "
+            "VALUES (%s, 0, '{}', '[]', %s)", (attempt["id"], now))
+        cursor.execute(
+            "UPDATE attempt_answers SET answers=%s, flagged=%s, rev=%s, updated_ts=%s "
+            "WHERE attempt_id=%s AND rev < %s",
+            (json.dumps(answers, ensure_ascii=False), json.dumps(flagged), rev, now, attempt["id"], rev))
+        applied = cursor.rowcount > 0
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        cursor.close()
+    return "saved" if applied else "stale"
+
+
+def load_progress(db, attempt_id):
+    """Latest autosave: {'rev': int, 'answers': dict, 'flagged': list} (empty if none)."""
+    _fresh(db)
+    cursor = db.cursor(buffered=True)
+    cursor.execute("SELECT rev, answers, flagged FROM attempt_answers WHERE attempt_id=%s", (attempt_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    empty = {"rev": 0, "answers": {}, "flagged": []}
+    if not row:
+        return empty
+    try:
+        answers, flagged = json.loads(row[1]), json.loads(row[2])
+    except (TypeError, ValueError):
+        return empty
+    answers, flagged = clean_progress(answers, flagged)
+    return {"rev": int(row[0]), "answers": answers, "flagged": flagged}
+
+
+def find_unsubmitted(db, now=None, limit=200):
+    """
+    Attempts that are over (deadline + grace passed, or terminated/closed a while ago)
+    but never received a submission. Returns [(attempt, username, name, exam_title)].
+    """
+    now = int(now if now is not None else time.time())
+    _fresh(db)
+    cursor = db.cursor(buffered=True)
+    cursor.execute(
+        "SELECT a.id, a.user_id, a.exam_key, a.status, a.started_ts, a.deadline_ts, a.ended_ts, "
+        "a.warning_count, u.username, u.name, e.title "
+        "FROM exam_attempts a "
+        "LEFT JOIN users u ON u.id = a.user_id "
+        "LEFT JOIN exams e ON e.exam_key = a.exam_key "
+        "WHERE NOT EXISTS (SELECT 1 FROM exam_submissions s WHERE s.attempt_id = a.id) "
+        "AND ((a.status = 'in_progress' AND a.deadline_ts + %s < %s) "
+        "  OR (a.status <> 'in_progress' AND COALESCE(a.ended_ts, 0) + %s < %s)) "
+        "ORDER BY a.id LIMIT %s",
+        (SUBMIT_GRACE_SECONDS, now, SUBMIT_GRACE_SECONDS, now, limit))
+    rows = cursor.fetchall()
+    cursor.close()
+    return [(_row_to_attempt(r[:8]), r[8] or "", r[9] or "", r[10] or r[2]) for r in rows]
+
+
+def finalize_unsubmitted(db, record_score=None, now=None):
+    """
+    For attempts whose browser never submitted (tab closed, battery died, connection lost),
+    stores the last autosaved answers as the submission so the work is not lost.
+    record_score(attempt, answers) is called for each new submission. Returns how many were created.
+    """
+    created = 0
+    for attempt, username, name, title in find_unsubmitted(db, now):
+        try:
+            progress = load_progress(db, attempt["id"])
+            status = "terminated" if attempt["status"] == TERMINATED else "time_up"
+            _final, duplicate = save_submission(
+                db, attempt, status, json.dumps(progress["answers"], ensure_ascii=False),
+                name or username, username, title, now, auto_closed=True)
+        except Exception:
+            db.rollback()
+            log.exception("Could not finalize attempt %s from its autosave", attempt["id"])
+            continue
+        if duplicate:
+            continue
+        created += 1
+        if record_score:
+            try:
+                record_score(attempt, progress["answers"])
+            except Exception:
+                db.rollback()
+                log.exception("Submission for attempt %s was saved but could not be scored", attempt["id"])
+    return created
+
+
 def reinstate(db, user_id, exam_key):
     """
     Teacher/admin action (UI comes in the review-workflow step): removes the
@@ -305,6 +467,9 @@ def reinstate(db, user_id, exam_key):
     """
     cursor = db.cursor()
     cursor.execute("DELETE FROM exam_locks WHERE user_id=%s AND exam_key=%s", (user_id, exam_key))
+    cursor.execute(
+        "DELETE FROM attempt_answers WHERE attempt_id IN "
+        "(SELECT id FROM exam_attempts WHERE user_id=%s AND exam_key=%s)", (user_id, exam_key))
     cursor.execute("DELETE FROM exam_attempts WHERE user_id=%s AND exam_key=%s", (user_id, exam_key))
     db.commit()
     cursor.close()
